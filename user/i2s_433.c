@@ -1,0 +1,583 @@
+/******************************************************************************
+ * This file is a heaviliy modified version of file is2_freetos.c from
+ * https://github.com/espressif/ESP8266_MP3_DECODER and the copyright of
+ * Espressif Systems is acknowledged.
+ *
+ * Copyright 2013-2015 Espressif Systems
+ *
+ * Routines that use the I2S and DMA hardware of the esp8266 board to generate
+ * a stable output signal that can be used to drive a 433MHz transmitter.
+ *
+ * The code is very specific to transmission characteristics of the devices
+ * being emulated but the code can be readily customized for your device.
+ * The comments are intended to guide you!
+ *
+ *******************************************************************************/
+
+#define DEBUG
+
+#ifdef DEBUG
+#define CONSOLE(FMT, args...) ets_uart_printf(FMT,  ##args); ets_uart_printf("\n")
+#else
+#define CONSOLE(FMT, args...)
+#endif
+
+/**
+ * The original code was written for the FreeRTOS operating system but this
+ * port has been reworked for the Non-OS environment.
+ */
+
+/**
+ * Each GPIO pin has a number of functions.  The ESP8266 code doesn't always
+ * define the possible values in existing header files so here are the values
+ * required for the three I2S lines.
+ */
+#define FUNC_I2SO_BCK                       1
+#define FUNC_I2SO_DATA                      1
+#define FUNC_I2SO_WS                        1
+
+#include "ets_sys.h"
+#include "osapi.h"
+#include "os_type.h"
+#include "mem.h"
+#include "driver/i2s_reg.h"
+#include "driver/slc_register.h"
+#include "driver/sdio_slv.h"
+#include "driver/i2s_433.h"
+
+/**
+ * We need some defines that aren't in some RTOS SDK versions. Define them
+ * here if we can't find them.
+ *
+ * Sadly these are 'black magic' definitions with no documentation explaining
+ * what they do!
+ */
+#ifndef i2c_bbpll
+#define i2c_bbpll                                 0x67
+#define i2c_bbpll_en_audio_clock_out            4
+#define i2c_bbpll_en_audio_clock_out_msb        7
+#define i2c_bbpll_en_audio_clock_out_lsb        7
+#define i2c_bbpll_hostid                           4
+#endif
+
+#define i2c_writeReg_Mask(block, host_id, reg_add, Msb, Lsb, indata)  rom_i2c_writeReg_Mask(block, host_id, reg_add, Msb, Lsb, indata)
+#define i2c_readReg_Mask(block, host_id, reg_add, Msb, Lsb)  rom_i2c_readReg_Mask(block, host_id, reg_add, Msb, Lsb)
+#define i2c_writeReg_Mask_def(block, reg_add, indata) \
+      i2c_writeReg_Mask(block, block##_hostid,  reg_add,  reg_add##_msb,  reg_add##_lsb,  indata)
+#define i2c_readReg_Mask_def(block, reg_add) \
+      i2c_readReg_Mask(block, block##_hostid,  reg_add,  reg_add##_msb,  reg_add##_lsb)
+
+/**
+ * These definitions mirror those already existing in the Non-OS SDK.  They
+ * were never defined for the SLC function.
+ */
+#ifndef ETS_SLC_INUM
+#define ETS_SLC_INUM       1
+#endif
+
+#ifndef ETS_SLC_INTR_ATTACH
+#define ETS_SLC_INTR_ATTACH(func, arg) \
+        ets_isr_attach(ETS_SLC_INUM, (func), (void *)(arg))
+#endif
+
+#ifndef ETS_SLC_INTR_ENABLE
+#define ETS_SLC_INTR_ENABLE()               ETS_INTR_ENABLE(ETS_SLC_INUM)
+#endif
+
+#ifndef ETS_SLC_INTR_DISABLE
+#define ETS_SLC_INTR_DISABLE()              ETS_INTR_DISABLE(ETS_SLC_INUM)
+#endif
+
+/**
+ * The following definitions are specific to this example.
+ *
+ * ** YOU WILL WANT TO CHANGE THESE ***
+ */
+
+/**
+ * Each 433MHz transmission is the data sent 7 times plus a short end frame.
+ */
+#define I2SDMABUFCNT 8
+
+/**
+ * The encoding of each data frame is that:
+ *
+ * - it starts with a 400us high then (17*400us) low frame marker
+ * - a data '0' is a 400us high then (4*400us) low
+ * - a data '1' is a 400us hugh then (8*400us) low
+ *
+ * Since '1' is longer than '0' the longest frame is that which sends
+ * data 0xFFFFFFFF and if we describe 400us as 'one unit', a frame for
+ * 0xFFFFFFFF requires:
+ *
+ * 1+17+32*(1+8) = 306 units.
+ */
+#define I2SDMABUFLEN (306)		//Length of one buffer, in 32-bit words.
+
+/**
+ * Data buffers that will hold the representation of the data frames. We
+ * allocate the actually data buffers but the final frame is two units,
+ * a high which marks the end of the last data frame and then low so we
+ * just put this on the stack.
+ */
+static uint32 *i2sBuf[I2SDMABUFCNT-1];
+static uint32 i2sBuf4[2];
+static uint32 *i2s_write_ptr;
+static uint32 i2s_write_len;
+#ifdef DEBUG
+/**
+ * Debug only field which checks that we have not written off the end of
+ * the data buffer.
+ */
+static uint32 *i2s_dbg_write_end = NULL;
+#endif
+
+/**
+ * The DMA controller is told about the data it is going to send through a
+ * chain of buffer descriptors.  In the MP3 example this is a continuous
+ * loop but in our case we set up a chain with a start and an end.
+ *
+ * There is one descriptor for each frame buffer, so 8.
+ */
+static struct sdio_queue i2sBufDesc[I2SDMABUFCNT];
+
+static I2S_SEND_COMPLETE i2s_callback;
+#ifdef DEBUG
+/**
+ * Debug only timings that give a ROUGH idea of how long it too to transmit
+ * all the data.  The timing are VERY ROUGH!
+ */
+volatile uint32 slc_dbg_send_start;
+volatile uint32 slc_dbg_send_end;
+#endif
+
+/**
+ * Our DMA is free running once we set it off but we want to know when it has
+ * completed.  So we have the interrupt function that is called at DMA end set
+ * a flag that we query using a repeating timer.
+ *
+ * We have deliberately set the time period to be 'the time it should take for
+ * the DMA to complete' so we should probably always have ended DMA transfer
+ * before the first timer check.
+ *
+ * Max timer = ((7 * 306) + 2) * 400us = 857600us ~ 860ms
+ *
+ */
+volatile bool slc_send_active = FALSE;
+static os_timer_t i2s_poll_timer = { 0 };
+#define I2S_POLL_TIMER_INTERVAL 860
+
+/**
+ * Forward function prototypes for internal functions.
+ */
+void ICACHE_FLASH_ATTR i2sSetRate();
+LOCAL void ICACHE_FLASH_ATTR i2sWrite433(int);
+LOCAL void ICACHE_FLASH_ATTR i2sWriteI2s(int valueOne);
+
+/**
+ * The DMA code is programmed to call the interrupt when it has finished
+ * transmitting.  We do as little as possible whilst in this interrupt and
+ * use a timer to monitor that boolean that we set when the DMA/I2S has
+ * finished transmitted our 433MHz data.
+ */
+LOCAL void slc_isr(void *arg) {
+
+	uint32 slc_intr_status;
+
+	//Grab int status
+	slc_intr_status = READ_PERI_REG(SLC_INT_STATUS);
+
+	//clear all intr flags
+	WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff); //slc_intr_status);
+
+	if (slc_intr_status & SLC_RX_EOF_INT_ST) {
+		//The DMA subsystem is done.
+#ifdef DEBUG
+		slc_dbg_send_end = system_get_time();
+#endif
+		slc_send_active = FALSE;
+	}
+}
+
+#ifdef DEBUG
+/*
+ * In order to check your timings, you can look at the total send time
+ * and divide that by the number if bits that you set to find the
+ * interval timer per bit.
+ */
+uint32 slc_dbg_get_send_time(void)
+{
+	CONSOLE("Times: %d, %d", slc_dbg_send_start, slc_dbg_send_end);
+	return(slc_dbg_send_end - slc_dbg_send_start);
+}
+#endif
+
+/**
+ * Timer that is called to poll the DMA/I2S sending status and call the
+ * user callback function when sending is complete.
+ */
+LOCAL void slc_isr_poll(void *arg) {
+	CONSOLE("DMA poll...");
+	if (slc_send_active) {
+		CONSOLE("DMA send still active");
+		return;
+	}
+	CONSOLE("DMA send has completed");
+
+	// Stop the DMA - probably not need 'belt-n-braces'.
+	CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
+	if (i2s_callback != NULL) {
+		CONSOLE("DMA all done");
+		os_timer_disarm(&i2s_poll_timer);
+		i2s_callback();
+	}
+}
+
+/**
+ * Initialize the 433MHz send system.
+ *
+ *  The I2S clock cannot be slowed to anything like one-clock-per-433-unit.
+ *  At best it's out by a factor of 21 so we use a factor of 32 and use a
+ *  uint32 to represent each 433MHz unit; this also makes building frames
+ *  simpler.
+ *
+ *  So we use three identical buffers, one per frame, and each of:
+ *
+ *    (1 + 17 + 32 * (1 + 8)) * 4 = 306 * 4 = 1224 bytes.
+ *
+ *  We also use a pre-allocated two byte end buffer to hold a final HIGH/LOW
+ *  and we string the buffers together using 4 buffer descriptors.
+ *
+ *  Each frame is a multiple of 32 bits, regardless of what it contains, so we
+ *  can use the 'datalen' field to ensure that we only send precisely the
+ *  frame out which means we do not have any unexpected delays between frames.
+ */
+void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
+
+	int ii;
+
+	// Store off the callback to be made when the transmission
+	// completes.
+	i2s_callback = callback;
+
+	// Set the poll timer callback.
+	os_timer_disarm(&i2s_poll_timer);
+	os_timer_setfn(&i2s_poll_timer, slc_isr_poll, NULL);
+
+	// Allocate the buffer used to hold the data to send.
+	for (ii = 0; ii < (I2SDMABUFCNT - 1); ii++)
+	{
+	    i2sBuf[ii] = (uint32 *)os_zalloc(I2SDMABUFLEN * 4);
+	}
+#ifdef DEBUG
+	i2s_dbg_write_end = &i2sBuf[0][I2SDMABUFLEN];
+#endif
+
+	//Reset DMA
+	SET_PERI_REG_MASK(SLC_CONF0, SLC_RXLINK_RST|SLC_TXLINK_RST);
+	CLEAR_PERI_REG_MASK(SLC_CONF0, SLC_RXLINK_RST|SLC_TXLINK_RST);
+
+	//Clear DMA int flags
+	SET_PERI_REG_MASK(SLC_INT_CLR, 0xffffffff);
+	CLEAR_PERI_REG_MASK(SLC_INT_CLR, 0xffffffff);
+
+	//Enable and configure DMA
+	CLEAR_PERI_REG_MASK(SLC_CONF0, (SLC_MODE<<SLC_MODE_S));
+	SET_PERI_REG_MASK(SLC_CONF0, (1<<SLC_MODE_S));
+	SET_PERI_REG_MASK(SLC_RX_DSCR_CONF,
+			SLC_INFOR_NO_REPLACE|SLC_TOKEN_NO_REPLACE);
+	CLEAR_PERI_REG_MASK(SLC_RX_DSCR_CONF,
+			SLC_RX_FILL_EN|SLC_RX_EOF_MODE | SLC_RX_FILL_MODE);
+
+	/**
+	 * Initialize the DMA buffer descriptors so that they reference the buffers
+	 * and also causes the DMA to stop and trigger the interrupt when sending
+	 * the last buffer completed.
+	 *
+	 * Note that unlike the MP3 example, we are not creating a loop and we do
+	 * not set 'eof = 1' for every buffer because we only care about sending
+	 * all the data as a single logical block.
+	 */
+	for (ii = 0; ii < (I2SDMABUFCNT - 1); ii++)
+	{
+		i2sBufDesc[ii].owner = 1;
+		i2sBufDesc[ii].eof = 0;
+		i2sBufDesc[ii].sub_sof = 0;
+		i2sBufDesc[ii].datalen = I2SDMABUFLEN * 4;
+		i2sBufDesc[ii].blocksize = I2SDMABUFLEN * 4;
+		i2sBufDesc[ii].buf_ptr = (uint32_t)i2sBuf[ii];
+		i2sBufDesc[ii].unused = 0;
+		i2sBufDesc[ii].next_link_ptr = (uint32_t)&i2sBufDesc[ii + 1];
+	}
+
+	/**
+	 * The last buffer descriptor is special; it references the two unit end
+	 * frame and has the eof flag set to trigger the interrupt.
+	 */
+	i2sBufDesc[ii].owner = 1;
+	i2sBufDesc[ii].eof = 1;
+	i2sBufDesc[ii].sub_sof = 0;
+	i2sBufDesc[ii].datalen = (2 * 4);
+	i2sBufDesc[ii].blocksize = (2 * 4);
+	i2sBufDesc[ii].buf_ptr = (uint32_t)i2sBuf4;
+	i2sBufDesc[ii].unused = 0;
+	i2sBufDesc[ii].next_link_ptr = 0;
+
+	/**
+	 * The MP3 code does this once and once only because it starts the DMA
+	 * transfer and that then runs forever.  The 433HMz code sets, and resets
+	 * the DMA code for each new data to be transmitted so this code is
+	 * moved from the 'init' function to the 'send' function.
+	 */
+#ifdef MP3
+	//Feed dma the 1st buffer desc addr
+	//To send data to the I2S subsystem, counter-intuitively we use the RXLINK part, not the TXLINK as you might
+	//expect. The TXLINK part still needs a valid DMA descriptor, even if it's unused: the DMA engine will throw
+	//an error at us otherwise. Just feed it any random descriptor.
+	CLEAR_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_DESCADDR_MASK);
+	SET_PERI_REG_MASK(SLC_TX_LINK,
+			((uint32)&i2sBufDesc) & SLC_TXLINK_DESCADDR_MASK); //any random desc is OK, we don't use TX but it needs something valid
+	CLEAR_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_DESCADDR_MASK);
+	SET_PERI_REG_MASK(SLC_RX_LINK,
+			((uint32)&i2sBufDesc) & SLC_RXLINK_DESCADDR_MASK);
+#endif
+
+	//Attach the DMA interrupt
+	ETS_SLC_INTR_ATTACH(slc_isr, NULL);
+
+#ifdef MP3
+	//Enable DMA operation intr
+	WRITE_PERI_REG(SLC_INT_ENA, SLC_RX_EOF_INT_ENA);
+	//clear any interrupt flags that are set
+	WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff);
+	///enable DMA intr in cpu
+	ETS_INTR_ENABLE(ETS_SLC_INUM);
+	//Start transmission
+	SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
+	SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
+#endif
+
+
+	/**
+	 * Init pins to i2s functions
+	 *
+	 * The MP3 code actually does real I2S and uses the three I2S lines.
+	 * Our 433MHz code (mis)uses the interface to just throw the data line
+	 * high/low to create the 433MHz pattern and we have not use for the
+	 * other I2S clock lines.
+	 */
+	PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_I2SO_DATA);
+#ifdef MP3
+	PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_I2SO_WS);
+	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDO_U, FUNC_I2SO_BCK);
+#endif
+
+	//Enable clock to i2s subsystem
+  i2c_writeReg_Mask_def(i2c_bbpll, i2c_bbpll_en_audio_clock_out, 1);
+
+	//Reset I2S subsystem
+	CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_RESET_MASK);
+	SET_PERI_REG_MASK(I2SCONF, I2S_I2S_RESET_MASK);
+	CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_RESET_MASK);
+
+	//Select 16bits per channel (FIFO_MOD=0), no DMA access (FIFO only)
+	CLEAR_PERI_REG_MASK(I2S_FIFO_CONF,
+			I2S_I2S_DSCR_EN|(I2S_I2S_RX_FIFO_MOD<<I2S_I2S_RX_FIFO_MOD_S)|(I2S_I2S_TX_FIFO_MOD<<I2S_I2S_TX_FIFO_MOD_S));
+	//Enable DMA in i2s subsystem
+	SET_PERI_REG_MASK(I2S_FIFO_CONF, I2S_I2S_DSCR_EN);
+
+	//tx/rx binaureal
+	CLEAR_PERI_REG_MASK(I2SCONF_CHAN,
+			(I2S_TX_CHAN_MOD<<I2S_TX_CHAN_MOD_S)|(I2S_RX_CHAN_MOD<<I2S_RX_CHAN_MOD_S));
+
+	//Clear int
+	SET_PERI_REG_MASK(I2SINT_CLR,
+			I2S_I2S_TX_REMPTY_INT_CLR|I2S_I2S_TX_WFULL_INT_CLR| I2S_I2S_RX_WFULL_INT_CLR|I2S_I2S_PUT_DATA_INT_CLR|I2S_I2S_TAKE_DATA_INT_CLR);
+	CLEAR_PERI_REG_MASK(I2SINT_CLR,
+			I2S_I2S_TX_REMPTY_INT_CLR|I2S_I2S_TX_WFULL_INT_CLR| I2S_I2S_RX_WFULL_INT_CLR|I2S_I2S_PUT_DATA_INT_CLR|I2S_I2S_TAKE_DATA_INT_CLR);
+
+	//trans master&rece slave,MSB shift,right_first,msb right
+	CLEAR_PERI_REG_MASK(I2SCONF,
+			I2S_TRANS_SLAVE_MOD| (I2S_BITS_MOD<<I2S_BITS_MOD_S)| (I2S_BCK_DIV_NUM <<I2S_BCK_DIV_NUM_S)| (I2S_CLKM_DIV_NUM<<I2S_CLKM_DIV_NUM_S));
+	SET_PERI_REG_MASK(I2SCONF,
+			I2S_RIGHT_FIRST|I2S_MSB_RIGHT|I2S_RECE_SLAVE_MOD| I2S_RECE_MSB_SHIFT|I2S_TRANS_MSB_SHIFT| ((16&I2S_BCK_DIV_NUM )<<I2S_BCK_DIV_NUM_S)| ((7&I2S_CLKM_DIV_NUM)<<I2S_CLKM_DIV_NUM_S));
+
+	//No idea if ints are needed...
+	//clear int
+	SET_PERI_REG_MASK(I2SINT_CLR,
+			I2S_I2S_TX_REMPTY_INT_CLR|I2S_I2S_TX_WFULL_INT_CLR| I2S_I2S_RX_WFULL_INT_CLR|I2S_I2S_PUT_DATA_INT_CLR|I2S_I2S_TAKE_DATA_INT_CLR);
+	CLEAR_PERI_REG_MASK(I2SINT_CLR,
+			I2S_I2S_TX_REMPTY_INT_CLR|I2S_I2S_TX_WFULL_INT_CLR| I2S_I2S_RX_WFULL_INT_CLR|I2S_I2S_PUT_DATA_INT_CLR|I2S_I2S_TAKE_DATA_INT_CLR);
+	//enable int
+	SET_PERI_REG_MASK(I2SINT_ENA,
+			I2S_I2S_TX_REMPTY_INT_ENA|I2S_I2S_TX_WFULL_INT_ENA| I2S_I2S_RX_REMPTY_INT_ENA|I2S_I2S_TX_PUT_DATA_INT_ENA|I2S_I2S_RX_TAKE_DATA_INT_ENA);
+}
+
+/**
+ * Send the DMA.
+ */
+void ICACHE_FLASH_ATTR i2sSendSignal(void) {
+	//Start transmission
+	if (slc_send_active)
+	{
+		CONSOLE("Already sending...");
+	}
+	else
+	{
+		CONSOLE("Start poll timer...");
+		os_timer_arm(&i2s_poll_timer, I2S_POLL_TIMER_INTERVAL, TRUE);
+
+		CONSOLE("Start the DMA...");
+		slc_send_active = TRUE;
+
+		/**
+		 * These are the bits that were moved from the init function.
+		 */
+		CLEAR_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_DESCADDR_MASK);
+		SET_PERI_REG_MASK(SLC_TX_LINK,
+				((uint32)&i2sBufDesc[0]) & SLC_TXLINK_DESCADDR_MASK); //any random desc is OK, we don't use TX but it needs something valid
+		CLEAR_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_DESCADDR_MASK);
+		SET_PERI_REG_MASK(SLC_RX_LINK,
+				((uint32)&i2sBufDesc[0]) & SLC_RXLINK_DESCADDR_MASK);
+
+		//Enable DMA operation intr
+		WRITE_PERI_REG(SLC_INT_ENA, SLC_RX_EOF_INT_ENA);
+		//clear any interrupt flags that are set
+		WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff);
+		///enable DMA intr in cpu
+		ETS_INTR_ENABLE(ETS_SLC_INUM);
+		SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
+		SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
+
+		// Set the send rate.
+		i2sSetRate();
+#ifdef DEBUG
+		slc_dbg_send_start = system_get_time();
+#endif
+		SET_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
+	}
+}
+
+void ICACHE_FLASH_ATTR i2sSetRate() {
+	/*
+	 * CLK_I2S = 160MHz / I2S_CLKM_DIV_NUM
+	 * BCLK = CLK_I2S / I2S_BCK_DIV_NUM
+	 * WS = BCLK/ 2 / (16 + I2S_BITS_MOD)
+	 *
+	 * But the MP3 documentation is wrong; the dividers cannot be more than
+	 * 63 NOT 127.  Our 400us time units mean we need to try and reach a
+	 * clock frequency of:
+	 *
+	 *   400us => 1000000s / 400us = 2500Hz
+	 *
+	 * But since our dividers are limited to 63 each we cannot go slower than
+	 *
+	 *   160MHz / (63 * 63) = 40312Hz
+	 *
+	 * So instead we scale up by 32 and instead of sending a single high/low
+	 * for 400us, we send 32 high/low, each for 400/32 = 12.5us.  So now the
+	 * clock scale factor we need us:
+	 *
+	 * 12.5us / (1s / 160MHz) = 2000 or 50 * 40.
+	 *
+	 * So we us 50 and 40 as our dividers and wherever we might have added a
+	 * single '0/1' bit to our DMA buffer we add 32 to them, a uint32_t!
+	 */
+	CLEAR_PERI_REG_MASK(I2SCONF,
+			I2S_TRANS_SLAVE_MOD| (I2S_BITS_MOD<<I2S_BITS_MOD_S)| (I2S_BCK_DIV_NUM <<I2S_BCK_DIV_NUM_S)| (I2S_CLKM_DIV_NUM<<I2S_CLKM_DIV_NUM_S));
+	SET_PERI_REG_MASK(I2SCONF,
+         	(I2S_RIGHT_FIRST| I2S_MSB_RIGHT| I2S_RECE_SLAVE_MOD| I2S_RECE_MSB_SHIFT| I2S_TRANS_MSB_SHIFT|
+         			(50<<I2S_BCK_DIV_NUM_S)|
+					(40<<I2S_CLKM_DIV_NUM_S)));
+}
+
+/**
+ * Reset the write pointers.
+ */
+void ICACHE_FLASH_ATTR i2sInitSignal() {
+	int ii;
+
+	i2s_write_ptr = &i2sBuf[0][0];
+	i2s_write_len = 0;
+}
+
+/**
+ * Copy the written signal to the other three buffers and
+ * set the frame length for each buffer descriptor.
+ */
+void ICACHE_FLASH_ATTR i2sTermSignal()
+{
+	int ii;
+	// Copy the same data frame into the other 6 data frames.
+	for (ii = 1; ii < (I2SDMABUFCNT - 1); ii++)
+	{
+		os_memcpy(i2sBuf[ii], i2sBuf[0], i2s_write_len);
+	}
+	// Set the length of data to transmit in each frame.
+	for (ii = 0; ii < (I2SDMABUFCNT - 1); ii++)
+	{
+		i2sBufDesc[ii].datalen = i2s_write_len;
+	}
+
+#ifdef DEBUG
+	CONSOLE("write_len: %d", i2s_write_len);
+	if (i2s_write_ptr > i2s_dbg_write_end)
+	{
+		/**
+		 * Oh dear, we wrote off the end of the data buffer!
+		 */
+		CONSOLE("ERROR: Wrote off end of data buffer.");
+	}
+#endif
+}
+
+/**
+ * Write a data Frame marker, which is a HIGH for 1 unit and LOW for 17 units.
+ */
+void ICACHE_FLASH_ATTR i2sWriteFrame() {
+	i2sWrite433(17);
+}
+
+/**
+ * Write a data Zero, which is a HIGH for 1 unit and LOW for 4 units.
+ */
+void ICACHE_FLASH_ATTR i2sWriteZero() {
+	i2sWrite433(4);
+}
+
+/**
+ * Write a data One, which is a HIGH for 1 unit and LOW for 8 units.
+ */
+void ICACHE_FLASH_ATTR i2sWriteOne() {
+	i2sWrite433(8);
+}
+
+/**
+ * Write the 433MHz component which is a single 400us HIGH followed
+ * by a number of 400us LOWs.
+ */
+LOCAL void ICACHE_FLASH_ATTR i2sWrite433(int lowCount) {
+	i2sWriteI2s(TRUE);
+	while (lowCount--) {
+		i2sWriteI2s(FALSE);
+	}
+}
+
+/**
+ * Write 1 or 0 DMA bits into the I2S buffer.  If you have to write a number
+ * of bits that are not a power of 2, then this will be a far more
+ * interesting function than this one!
+ */
+LOCAL void ICACHE_FLASH_ATTR i2sWriteI2s(int valueOne)
+{
+	// Note how we are scaling each bit up by 32!
+	if (valueOne)
+	{
+		(*i2s_write_ptr++) = 0xFFFFFFFF;
+	}
+	else
+	{
+		(*i2s_write_ptr++) = 0;
+	}
+	i2s_write_len += 4;
+}
