@@ -223,12 +223,12 @@ LOCAL void slc_isr_poll(void *arg) {
 		return;
 	}
 	CONSOLE("DMA send has completed");
+	os_timer_disarm(&i2s_poll_timer);
 
 	// Stop the DMA - probably not need 'belt-n-braces'.
 	CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
 	if (i2s_callback != NULL) {
 		CONSOLE("DMA all done");
-		os_timer_disarm(&i2s_poll_timer);
 		i2s_callback();
 	}
 }
@@ -411,6 +411,9 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
 	//enable int
 	SET_PERI_REG_MASK(I2SINT_ENA,
 			I2S_I2S_TX_REMPTY_INT_ENA|I2S_I2S_TX_WFULL_INT_ENA| I2S_I2S_RX_REMPTY_INT_ENA|I2S_I2S_TX_PUT_DATA_INT_ENA|I2S_I2S_RX_TAKE_DATA_INT_ENA);
+
+	// Set the send rate.
+	i2sSetRate();
 }
 
 /**
@@ -448,9 +451,6 @@ void ICACHE_FLASH_ATTR i2sSendSignal(void) {
 		ETS_INTR_ENABLE(ETS_SLC_INUM);
 		SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
 		SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
-
-		// Set the send rate.
-		i2sSetRate();
 #ifdef DEBUG
 		slc_dbg_send_start = system_get_time();
 #endif
@@ -488,7 +488,7 @@ void ICACHE_FLASH_ATTR i2sSetRate() {
 	SET_PERI_REG_MASK(I2SCONF,
          	(I2S_RIGHT_FIRST| I2S_MSB_RIGHT| I2S_RECE_SLAVE_MOD| I2S_RECE_MSB_SHIFT| I2S_TRANS_MSB_SHIFT|
          			(50<<I2S_BCK_DIV_NUM_S)|
-					(40<<I2S_CLKM_DIV_NUM_S)));
+					(48<<I2S_CLKM_DIV_NUM_S)));
 }
 
 /**
@@ -508,6 +508,7 @@ void ICACHE_FLASH_ATTR i2sInitSignal() {
 void ICACHE_FLASH_ATTR i2sTermSignal()
 {
 	int ii;
+
 	// Copy the same data frame into the other 6 data frames.
 	for (ii = 1; ii < (I2SDMABUFCNT - 1); ii++)
 	{

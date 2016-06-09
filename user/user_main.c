@@ -23,9 +23,12 @@
 #define CFG_433_4_VALUE		(4 * CFG_433_1_VALUE)
 #define CFG_433_17_VALUE	(17 * CFG_433_1_VALUE)
 
-#define CFG_433_SENDER		0x40000000
+#define CFG_433_SENDER		0x94000000
 #define CFG_433_CHANNEL     0x00000000
-#define CFG_433_BATTERY     0x00400000
+#define CFG_433_BATTERY_OK  0x00800000
+#define CFG_433_BEEP        0x00400000
+#define CFG_433_00200000    0x00200000
+#define CFG_433_00100000    0x00100000
 #define CFG_433_MANUAL      0x00000000
 
 #define CFG_TEMP_SHIFT      8
@@ -82,7 +85,10 @@ static void send_433_temp(sint32 temperature)
 	data_433 = 0;
 	data_433 |= CFG_433_SENDER;
 	data_433 |= CFG_433_CHANNEL;
-	data_433 |= CFG_433_BATTERY;
+	data_433 |= CFG_433_BATTERY_OK;
+	// data_433 |= CFG_433_BEEP;
+	// data_433 |= CFG_433_00200000;
+	// data_433 |= CFG_433_00100000;
 	data_433 |= CFG_433_MANUAL;
 	data_433 |= ((temperature << CFG_TEMP_SHIFT) & CFG_TEMP_MASK);
 
@@ -125,7 +131,7 @@ static void send_433_temp(sint32 temperature)
  */
 static void send_loop(void *arg)
 {
-	static sint32 temp = -127;
+	static sint32 temp = -128;
 	static sint32 temp_inc = 1;
 
 	CONSOLE("Send temp: %d", temp);
@@ -169,5 +175,5 @@ void user_init(void)
 	CONSOLE("Start send timer");
     os_timer_disarm(&send_timer);
     os_timer_setfn(&send_timer, (os_timer_func_t *)send_loop, NULL);
-    os_timer_arm(&send_timer, 10000, TRUE);
+    os_timer_arm(&send_timer, 10*1000, TRUE);
 }
