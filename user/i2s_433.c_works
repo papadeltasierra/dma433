@@ -14,7 +14,8 @@
  *
  *****************************************************************************/
 
-#define DEBUG
+// #define DEBUG
+//#define SPLIT
 
 #ifdef DEBUG
 #define CONSOLE(FMT, args...) \
@@ -196,28 +197,6 @@ void ICACHE_FLASH_ATTR i2sSetRate();
 LOCAL void ICACHE_FLASH_ATTR i2sWrite433(int);
 LOCAL void ICACHE_FLASH_ATTR i2sWriteI2s(int valueOne);
 
-
-LOCAL void reg_dump()
-{
-	CONSOLE("SLC_CONF0:        %lu", READ_PERI_REG(SLC_CONF0));
-	CONSOLE("SLC_INT_CLR:      %lu", READ_PERI_REG(SLC_INT_CLR));
-	CONSOLE("SLC_RX_DSCR_CONF: %lu", READ_PERI_REG(SLC_RX_DSCR_CONF));
-	CONSOLE("I2SCONF:          %lu", READ_PERI_REG(I2SCONF));
-	CONSOLE("I2S_FIFO_CONF:    %lu", READ_PERI_REG(I2S_FIFO_CONF));
-	CONSOLE("I2S_FIFO_CONF:    %lu", READ_PERI_REG(I2S_FIFO_CONF));
-	CONSOLE("I2S_FIFO_CONF:    %lu", READ_PERI_REG(I2S_FIFO_CONF));
-	CONSOLE("I2S_FIFO_CONF:    %lu", READ_PERI_REG(I2S_FIFO_CONF));
-	CONSOLE("I2SINT_CLR:       %lu", READ_PERI_REG(I2SINT_CLR));
-	CONSOLE("I2SINT_ENA:       %lu", READ_PERI_REG(I2SINT_ENA));
-	CONSOLE("I2SINT_CLR:       %lu", READ_PERI_REG(I2SINT_CLR));
-	CONSOLE("SLC_TX_LINK:      %lu", READ_PERI_REG(SLC_TX_LINK));
-	CONSOLE("SLC_RX_LINK:      %lu", READ_PERI_REG(SLC_RX_LINK));
-	CONSOLE("SLC_INT_ENA:      %lu", READ_PERI_REG(SLC_INT_ENA));
-	CONSOLE("SLC_INT_CLR:      %lu", READ_PERI_REG(SLC_INT_CLR));
-	CONSOLE("SLC_INT_STATUS:   %lu", READ_PERI_REG(SLC_INT_STATUS));
-}
-
-
 /**
  * The DMA code is programmed to call the interrupt when it has finished
  * transmitting.  We do as little as possible whilst in this interrupt and
@@ -269,19 +248,10 @@ LOCAL void slc_isr_poll(void *arg) {
   CONSOLE("DMA send has completed");
   os_timer_disarm(&i2s_poll_timer);
 
+#if 0
   // Stop the DMA - probably not need 'belt-n-braces'.
   CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
-  SET_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_RESET);
-  CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_RESET);
-
-  CLEAR_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_PARK);
-  SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_RESTART);
-
-  // Whatever the above does, it means that the next DMA does not even start.
-  // Umm, which means that the DMA was restarting before?  In which case was
-  // it simply not transmitting correctly?  Is the ilnk from memory -> SLC etc
-  // Somehow broken?
-
+#endif
   if (i2s_callback != NULL) {
     CONSOLE("DMA all done");
     i2s_callback();
@@ -329,6 +299,7 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
   i2s_dbg_write_end = &i2sBuf[0][I2SDMABUFLEN];
 #endif
 
+#if 1
   /* 0001 */
   //Reset DMA
   SET_PERI_REG_MASK(SLC_CONF0, SLC_RXLINK_RST|SLC_TXLINK_RST);
@@ -346,6 +317,7 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
       SLC_INFOR_NO_REPLACE|SLC_TOKEN_NO_REPLACE);
   CLEAR_PERI_REG_MASK(SLC_RX_DSCR_CONF,
       SLC_RX_FILL_EN|SLC_RX_EOF_MODE | SLC_RX_FILL_MODE);
+#endif
 
   /**
    * Initialize the DMA buffer descriptors so that they reference the buffers
@@ -394,10 +366,25 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
   i2s_write_len = 0;
   i2sWriteFrame();
 
+#if 1
     /* 0002 */
     //Attach the DMA interrupt
       ETS_SLC_INTR_ATTACH(slc_isr, NULL);
+#endif
 
+#ifdef MP3
+  //Enable DMA operation intr
+  WRITE_PERI_REG(SLC_INT_ENA, SLC_RX_EOF_INT_ENA);
+  //clear any interrupt flags that are set
+  WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff);
+  ///enable DMA intr in cpu
+  ETS_INTR_ENABLE(ETS_SLC_INUM);
+  //Start transmission
+  SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
+  SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
+#endif
+
+#if 1
   /* 0003 */
   /**
    * Init pins to i2s functions
@@ -408,7 +395,13 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
    * other I2S clock lines.
    */
   PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_I2SO_DATA);
+#ifdef MP3
+  PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_I2SO_WS);
+  PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDO_U, FUNC_I2SO_BCK);
+#endif
+#endif
 
+#if 1
   /* 0004 */
   //Enable clock to i2s subsystem
   i2c_writeReg_Mask_def(i2c_bbpll, i2c_bbpll_en_audio_clock_out, 1);
@@ -466,6 +459,7 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
       I2S_I2S_TX_REMPTY_INT_ENA|I2S_I2S_TX_WFULL_INT_ENA|
       I2S_I2S_RX_REMPTY_INT_ENA|I2S_I2S_TX_PUT_DATA_INT_ENA|
       I2S_I2S_RX_TAKE_DATA_INT_ENA);
+#endif
 
   /**
    * The MP3 code does this once and once only because it starts the DMA
@@ -473,6 +467,23 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
    * the DMA code for each new data to be transmitted so this code is
    * moved from the 'init' function to the 'send' function.
    */
+#ifdef MP3
+  //Feed dma the 1st buffer desc addr
+  //To send data to the I2S subsystem, counter-intuitively we use the RXLINK
+  // part, not the TXLINK as you might
+  //expect. The TXLINK part still needs a valid DMA descriptor, even if it's
+  // unused: the DMA engine will throw
+  //an error at us otherwise. Just feed it any random descriptor.
+  CLEAR_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_DESCADDR_MASK);
+  SET_PERI_REG_MASK(SLC_TX_LINK,
+      ((uint32)&i2sBufDesc) & SLC_TXLINK_DESCADDR_MASK);
+  //any random desc is OK, we don't use TX but it needs something valid
+  CLEAR_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_DESCADDR_MASK);
+  SET_PERI_REG_MASK(SLC_RX_LINK,
+      ((uint32)&i2sBufDesc) & SLC_RXLINK_DESCADDR_MASK);
+#endif
+
+#ifndef SPLIT
     /* 0005 */
     /**
      * These are the bits that were moved from the init function.
@@ -488,19 +499,20 @@ void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE callback) {
     //Enable DMA operation intr
     save_slc_int_ena = READ_PERI_REG(SLC_INT_ENA);
     WRITE_PERI_REG(SLC_INT_ENA, SLC_RX_EOF_INT_ENA);
-
     //clear any interrupt flags that are set
     save_slc_int_clr = READ_PERI_REG(SLC_INT_CLR);
     WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff);
-
     ///enable DMA intr in cpu
     ETS_INTR_ENABLE(ETS_SLC_INUM);
     SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
     SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
+#endif
 
+#ifndef SPLIT
   /* 0006 */
   // Set the send rate.
   i2sSetRate();
+#endif
 }
 
 /**
@@ -520,19 +532,49 @@ void ICACHE_FLASH_ATTR i2sSendSignal(void) {
     CONSOLE("Start the DMA...");
     slc_send_active = TRUE;
 
+#if 1
+    /* 0005 */
+#ifdef SPLIT
+    /**
+     * These are the bits that were moved from the init function.
+     */
+    CLEAR_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_DESCADDR_MASK);
+    SET_PERI_REG_MASK(SLC_TX_LINK,
+        ((uint32)&i2sBufDesc[0]) & SLC_TXLINK_DESCADDR_MASK);
+        //any random desc is OK, we don't use TX but it needs something valid
+    CLEAR_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_DESCADDR_MASK);
+    SET_PERI_REG_MASK(SLC_RX_LINK,
+        ((uint32)&i2sBufDesc[0]) & SLC_RXLINK_DESCADDR_MASK);
+
+    //Enable DMA operation intr
+    // ??save_slc_int_ena = READ_PERI_REG(SLC_INT_ENA);
+    WRITE_PERI_REG(SLC_INT_ENA, SLC_RX_EOF_INT_ENA);
+    //clear any interrupt flags that are set
+    //?? save_slc_int_clr = READ_PERI_REG(SLC_INT_CLR);
+    WRITE_PERI_REG(SLC_INT_CLR, 0xffffffff);
+    ///enable DMA intr in cpu
+    ETS_INTR_ENABLE(ETS_SLC_INUM);
+    SET_PERI_REG_MASK(SLC_TX_LINK, SLC_TXLINK_START);
+    SET_PERI_REG_MASK(SLC_RX_LINK, SLC_RXLINK_START);
+#endif
+#endif
+
+#if 1
+    /* 0006 */
+#ifdef SPLIT
+	// Set the send rate.
+	i2sSetRate();
+#endif
+#endif
+
+#if 1
 	/* 0007 */
 #ifdef DEBUG
     slc_dbg_send_start = system_get_time();
 #endif
-
-    //Dump registers for info.
-    reg_dump();
-
-    // Try enabling the clock system again.
-    // BAD If we put things here, it doesn't work :-(.  The second transmit hangs.
-    // i2c_writeReg_Mask_def(i2c_bbpll, i2c_bbpll_en_audio_clock_out, 1);
-
     SET_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
+    // CLEAR_PERI_REG_MASK(I2SCONF, I2S_I2S_TX_START);
+#endif
   }
 }
 
@@ -704,4 +746,3 @@ LOCAL void ICACHE_FLASH_ATTR i2sWriteI2s(int valueOne)
   }
   i2s_write_len += 4;
 }
-

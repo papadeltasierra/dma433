@@ -9,8 +9,16 @@
 #include "mem.h"
 #include "driver/gpio16.h"
 #include "driver/uart.h"
+#include "config.h"
+#include "wifi.h"
+#include "sntp.h"
+#include "logging.h"
+#include "syslog.h"
+#define DEFINE_VARS
+#include "msg.h"
 
-#define CONSOLE(FMT, args...) ets_uart_printf(FMT,  ##args); ets_uart_printf("\n")
+//#define CONSOLE(FMT, args...) ets_uart_printf(FMT,  ##args); ets_uart_printf("\n")
+//#define CONSOLE(FMT, args...)
 
 /**
  * *** YOU WILL WANT TO CHANGE THIS ***
@@ -24,12 +32,10 @@
 #define CFG_433_17_VALUE	(17 * CFG_433_1_VALUE)
 
 #define CFG_433_SENDER		0x94000000
-#define CFG_433_CHANNEL     0x00000000
 #define CFG_433_BATTERY_OK  0x00800000
 #define CFG_433_BEEP        0x00400000
 #define CFG_433_00200000    0x00200000
 #define CFG_433_00100000    0x00100000
-#define CFG_433_MANUAL      0x00000000
 
 #define CFG_TEMP_SHIFT      8
 #define CFG_TEMP_MASK       0x000FFF00
@@ -71,12 +77,29 @@ void add_433_checksum(uint32 *data_433)
  * Build the 32-bit value that is used to transmit the temperature to
  * the base station and then request that it be sent three times.
  */
+static void send_433_data(uint32 data_433)
+{
+	/**
+	 * Now build the frame and send this using the new DMA/I2S infrastructure.
+	 */
+	ets_uart_printf("@");
+	CONSOLE("InitSignal...");
+	i2sInitSignal();
+	CONSOLE("BuildSignal...");
+	i2sDataValue(data_433);
+	CONSOLE("TermSignal...");
+	i2sTermSignal();
+	CONSOLE("SendSignal...");
+	i2sSendSignal();
+	CONSOLE("DMA is sending...");
+}
+/**
+ * Build the 32-bit value that is used to transmit the temperature to
+ * the base station and then request that it be sent three times.
+ */
 static void send_433_temp(sint32 temperature)
 {
 	uint32 data_433;
-	int ii;
-	int jj;
-	uint32 mask;
 
 	/**
 	 * First build the 32-bit value.
@@ -84,42 +107,14 @@ static void send_433_temp(sint32 temperature)
 	CONSOLE("Temp: %d", temperature);
 	data_433 = 0;
 	data_433 |= CFG_433_SENDER;
-	data_433 |= CFG_433_CHANNEL;
 	data_433 |= CFG_433_BATTERY_OK;
 	// data_433 |= CFG_433_BEEP;
 	// data_433 |= CFG_433_00200000;
 	// data_433 |= CFG_433_00100000;
-	data_433 |= CFG_433_MANUAL;
 	data_433 |= ((temperature << CFG_TEMP_SHIFT) & CFG_TEMP_MASK);
 
 	add_433_checksum(&data_433);
-	CONSOLE("Data: %u", data_433);
-
-	/**
-	 * Now build the frame and send this using the new DMA/I2S infrastructure.
-	 */
-	CONSOLE("InitSignal...");
-	i2sInitSignal();
-	CONSOLE("BuildSignal...");
-	mask = 0x80000000;
-	i2sWriteFrame();
-	for (jj = 0; jj < 32; jj++)
-	{
-		if (mask & data_433)
-		{
-			i2sWriteOne();
-		}
-		else
-		{
-			i2sWriteZero();
-		}
-		mask >>= 1;
-	}
-	CONSOLE("TermSignal...");
-	i2sTermSignal();
-	CONSOLE("SendSignal...");
-	i2sSendSignal();
-	CONSOLE("DMA is sending...");
+	send_433_data(data_433);
 }
 
 /**
@@ -147,13 +142,42 @@ static void send_loop(void *arg)
 	}
 }
 
+/**
+ * The first timer driven send now starts the repeating faster timer.
+ */
+static void send_loop_second(void *arg)
+{
+	os_timer_disarm(&send_timer);
+	os_timer_setfn(&send_timer, (os_timer_func_t *)send_loop, NULL);
+	// os_timer_arm(&send_timer, (29000 + 850 + 500), TRUE);
+	os_timer_arm(&send_timer, 30000, TRUE);
+	send_loop(arg);
+}
+
+static void send_loop_first(void *arg)
+{
+	os_timer_disarm(&send_timer);
+	os_timer_setfn(&send_timer, (os_timer_func_t *)send_loop, NULL);
+	// os_timer_arm(&send_timer, 122850, FALSE);
+	// os_timer_arm(&send_timer, 123350, FALSE);
+	// os_timer_arm(&send_timer, 123850, FALSE);
+	// Just, late os_timer_arm(&send_timer, 124350, FALSE);
+	// os_timer_arm(&send_timer, 124850, FALSE);
+	// os_timer_arm(&send_timer, 125350, FALSE);
+	// os_timer_arm(&send_timer, 30500, TRUE);
+	os_timer_arm(&send_timer, 30000, TRUE);
+	send_loop(arg);
+}
+
 static void send_callback(void *arg)
 {
 	/**
 	 * Sending has finished; log the time it took.
 	 */
+#if 0
 	uint32 send_time = slc_dbg_get_send_time();
     CONSOLE("Frame send in %dus", send_time);
+#endif
 }
 
 void user_init(void)
@@ -162,18 +186,52 @@ void user_init(void)
 	 * First set up the serial port so that we can see output from
 	 * logging etc.
 	 */
+	uint8 syslog_server[] = CFG_SYSLOG_SERVER;
+
+
 	UARTInit(BIT_RATE_76800);
 	CONSOLE("SDK version:%s", system_get_sdk_version());
 	CONSOLE("433MHz receiver active");
+
+	/**
+	 * Enable the syslogging.  Note that this will not do anything until there
+	 * is a successful WiFi connection.
+	 */
+	syslog_setup(syslog_server, CFG_SYSLOG_PORT, smsg_app_name, &smsg_procs[0], &smsg_msgs[0]);
+
+	/**
+	 * Now set up the connection to the WiFi network.
+	 */
+	wifi_setup(CFG_WIFI_SSID, CFG_WIFI_PWD);
+
+	/**
+	 * Set up the SNTP client which we use to get timestamps for logging etc.
+	 */
+	sntp_setup(CFG_NTP_SERVER_0,
+			   CFG_NTP_SERVER_1,
+			   CFG_NTP_SERVER_2,
+			   CFG_NTP_TIMEZONE);
+
+	/**
+	 * Start the watchdog timer.
+	 */
+	//wdog_setup(CFG_WDOG_INTERVAL);
 
 	CONSOLE("Initialize I2S...");
 	i2sInit(send_callback);
 
     /**
-     * Finally launch the timer that sends data every 10 seconds.
+     * We send data as follows:
+     *
+     * Data is sent every 31s to sync with the receiver which saves power
+     * by only enabling it's receive circuitry every 30-31s.
+     *
+     * We populate with data on each transmission and we will lose the
+     * 2/3/4 transmissions because the receiver will be waiting for the
+     * time-signal during this period.
      */
-	CONSOLE("Start send timer");
     os_timer_disarm(&send_timer);
-    os_timer_setfn(&send_timer, (os_timer_func_t *)send_loop, NULL);
-    os_timer_arm(&send_timer, 10*1000, TRUE);
+	CONSOLE("Start send timer");
+    os_timer_setfn(&send_timer, (os_timer_func_t *)send_loop_first, NULL);
+    os_timer_arm(&send_timer, 5000, FALSE);
 }

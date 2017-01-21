@@ -1,0 +1,8 @@
+# Ignore compiled files
+*.o
+*.out
+*.a
+
+# Ignore image files
+*.bin
+

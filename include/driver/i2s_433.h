@@ -23,6 +23,7 @@ typedef void (*I2S_SEND_COMPLETE)(void);
 void ICACHE_FLASH_ATTR i2sInit(I2S_SEND_COMPLETE);
 void ICACHE_FLASH_ATTR i2sSendSignal(void);
 void ICACHE_FLASH_ATTR i2sInitSignal();
+void ICACHE_FLASH_ATTR i2sDataValue(uint32 data_433);
 void ICACHE_FLASH_ATTR i2sTermSignal();
 void ICACHE_FLASH_ATTR i2sWriteFrame();
 void ICACHE_FLASH_ATTR i2sWriteZero();
